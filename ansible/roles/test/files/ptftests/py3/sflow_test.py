@@ -45,8 +45,10 @@ class SflowTest(BaseTest):
         self.router_mac = self.test_params['router_mac']
         self.dst_port = self.test_params['dst_port']
 
+        if 'egress_sflow_ports' not in self.test_params:
+            self.test_params['egress_sflow_ports'] = []
         if 'enabled_sflow_interfaces' in self.test_params:
-            self.enabled_intf = self.test_params['enabled_sflow_interfaces']
+            self.enabled_intf = self.test_params['enabled_sflow_interfaces'] 
         self.agent_id = self.test_params['agent_id']
         self.active_col = self.test_params['active_collectors']
         self.sflow_interfaces = []
@@ -63,7 +65,12 @@ class SflowTest(BaseTest):
         logging.info("Sflow interfaces under Test : %s" % self.interfaces)
         self.collectors = ['collector0', 'collector1']
         for param, value in self.test_params.items():
-            logging.info("%s : %s" % (param, value))
+            logging.info("%s : %s" % (param, value)) 
+        if self.test_params['egress_sflow_ports']:
+            self.egress_ports = {}
+            for port in self.test_params['egress_sflow_ports']:
+                self.egress_ports[port]={}
+                self.egress_ports[port] = self.interfaces.pop(port)
 
     def tearDown(self):
         self.cmd(["supervisorctl", "stop", "arp_responder"])
@@ -119,7 +126,6 @@ class SflowTest(BaseTest):
                 threading.current_thread().getName(), event_is_set))
 
         process.terminate()
-        process.wait()
         f.close()
         with open(outfile, 'r') as sflow_data:
             for line in sflow_data:
@@ -165,8 +171,16 @@ class SflowTest(BaseTest):
         logging.info(data)
         if data['total_flow_count']:
             data['flow_port_count'] = Counter(
-                k['inputPort'] for k in port_sample[collector]['FlowSample'].values())
-
+                k['inputPort'] for k in port_sample[collector]['FlowSample'].values()) 
+        if 'egress_sflow_enable' in self.test_params:
+            if not self.test_params['egress_sflow_enable']:
+                if not port_sample[collector]['FlowSample']:
+                    logging.info("....%s: Egress Sample Packets are not received as expected.As egress sampling is disabled" %(collector))
+                    return True
+                else:
+                    self.assertTrue(data['total_samples'] == 0,
+                            "Packets are not expected from %s , but received %s flow packets  and %s counter packets"
+                            % (collector, data['total_flow_count'], data['total_counter_count'])
         if collector not in self.active_col:
             logging.info("....%s : Sample Packets are not expected , received %s flow packets  and %s counter packets"
                          % (collector, data['total_flow_count'], data['total_counter_count']))
@@ -195,6 +209,18 @@ class SflowTest(BaseTest):
                                 "....Packets are not received in active collector  ,%s" % collector)
                 self.analyze_flow_sample(data, collector)
         return data
+
+    # --------------------------------------------------------------------------
+    def parseFlowSamples(self,collector_samples,collector):
+        self.egress_sampleCount = 0
+        self.ingress_sampleCount = 0
+        for flow_sample in collector_samples[collector]['FlowSample']:
+            src_port =  collector_samples[collector]['FlowSample'][flow_sample]['inputPort']
+            out_port =  collector_samples[collector]['FlowSample'][flow_sample]['outputPort']
+            if int(src_port) == int(out_port) :
+                self.egress_sampleCount += 1
+            else:
+                self.ingress_sampleCount += 1
 
     # --------------------------------------------------------------------------
 
@@ -235,6 +261,20 @@ class SflowTest(BaseTest):
                      data['flow_port_count'])
         logging.info("Expected number of packets from each port : %s to %s" % (
             100 * 0.6, 100 * 1.4))
+        upper_limit = 100 * 1.4 
+        self.parseFlowSamples(self.collector0_samples,collector)
+
+        print("********************** SFLOW_STATS ******************************")
+        print("FlowPortCOunt: {}".format(data['flow_port_count']))
+        print("EgressSampleCOunt: {}".format(self.egress_sampleCount))
+        print("IngressSampleCOunt: {}".format(self.ingress_sampleCount))
+        print("********************** SFLOW_STATS ******************************")
+
+        if self.test_params['egress_sflow_ports']:
+            for port in list(self.egress_ports):
+                self.interfaces[port] = {}
+                self.interfaces[port].update(self.egress_ports[port])
+
         for port in self.interfaces:
             # NOTE: hsflowd is sending index instead of ifindex.
             index = self.interfaces[port]['port_index']
@@ -244,8 +284,12 @@ class SflowTest(BaseTest):
                 # Checking samples with tolerance of 40 % as the sampling is random and not deterministic.
                 # Over many samples it should converge to a mean of 1:N
                 # Number of packets sent = 100 * sampling rate of interface
+                if port in self.test_params['egress_sflow_ports']:
+                    upper_limit = 100 * 1.4 * 4
+                    if self.test_params['asic_type'] == "marvell-teralynx":
+                        index = '0'
                 self.assertTrue(
-                    100 * 0.6 <= data['flow_port_count'][index] <= 100 * 1.4,
+                    100 * 0.6 <= data['flow_port_count'][index] <= upper_limit,
                     "Expected Number of samples are not collected from Interface %s in collector %s , Received %s"
                     % (port, collector, data['flow_port_count'][index]))
             else:
@@ -256,7 +300,10 @@ class SflowTest(BaseTest):
 
     def sendTraffic(self):
         src_ip_addr_templ = '192.168.{}.1'
-        ip_dst_addr = '192.168.0.4'
+        if 'dst_ip' in self.test_params:
+            ip_dst_addr  = self.test_params['dst_ip']
+        else:
+            ip_dst_addr = '192.168.0.4'
         src_mac = self.dataplane.get_mac(0, 0)
         pktlen = 100
         # send 100 * sampling_rate packets in each interface for better analysis
